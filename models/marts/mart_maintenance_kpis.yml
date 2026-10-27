@@ -1,0 +1,32 @@
+
+version: 2
+
+models:
+  - name: mart_maintenance_kpis
+    description: >
+      Maintenance performance KPIs aggregated by machine type.
+
+    columns:
+      - name: machine_type
+        data_tests:
+          - not_null
+          - unique
+          - accepted_values:
+              arguments:
+                values: ["L", "M", "H"]
+
+      - name: total_observations
+        data_tests:
+          - not_null
+
+      - name: failure_observations
+        data_tests:
+          - not_null
+
+      - name: failure_rate_pct
+        data_tests:
+          - not_null
+
+      - name: avg_temperature_delta_k
+        data_tests:
+          - not_null

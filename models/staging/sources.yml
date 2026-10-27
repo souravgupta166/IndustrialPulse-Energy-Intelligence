@@ -1,0 +1,14 @@
+
+version: 2
+
+sources:
+  - name: ai4i
+    description: >
+      Standardized AI4I predictive-maintenance data loaded
+      into the local DuckDB development warehouse.
+      The underlying dataset is synthetic.
+    schema: main
+    tables:
+      - name: raw_ai4i_machine_data
+        description: >
+          Raw warehouse table populated from the standardized CSV.

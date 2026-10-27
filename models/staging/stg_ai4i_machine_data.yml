@@ -1,0 +1,96 @@
+
+version: 2
+
+models:
+  - name: stg_ai4i_machine_data
+    description: >
+      Cleaned and standardized staging model for the synthetic
+      AI4I 2020 predictive-maintenance dataset.
+
+    columns:
+      - name: source_record_id
+        description: Deterministic source-row identifier, not a physical machine ID.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: machine_type
+        description: "Source machine category: L, M, or H."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["L", "M", "H"]
+
+      - name: air_temperature_k
+        description: Air temperature in Kelvin.
+        data_tests:
+          - not_null
+
+      - name: process_temperature_k
+        description: Process temperature in Kelvin.
+        data_tests:
+          - not_null
+
+      - name: rotational_speed_rpm
+        description: Rotational speed in revolutions per minute.
+        data_tests:
+          - not_null
+
+      - name: torque_nm
+        description: Torque in Newton-metres.
+        data_tests:
+          - not_null
+
+      - name: tool_wear_min
+        description: Tool wear in minutes.
+        data_tests:
+          - not_null
+
+      - name: machine_failure
+        description: Target label indicating whether a machine failure occurred.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: tool_wear_failure
+        description: Tool-wear failure indicator.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: heat_dissipation_failure
+        description: Heat-dissipation failure indicator.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: power_failure
+        description: Power failure indicator.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: overstrain_failure
+        description: Overstrain failure indicator.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: random_failure
+        description: Random failure indicator.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]

@@ -1,0 +1,31 @@
+# Python and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local data and database files
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.duckdb
+*.sqlite
+
+# Generated dbt files
+target/
+dbt_packages/
+logs/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+# Local DuckDB databases
+*.duckdb
+*.sqlite
