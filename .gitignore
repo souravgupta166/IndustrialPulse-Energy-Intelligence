@@ -29,3 +29,5 @@ logs/
 # Local DuckDB databases
 *.duckdb
 *.sqlite
+# Generated deployment-specific dbt profile
+.dbt_profiles/
