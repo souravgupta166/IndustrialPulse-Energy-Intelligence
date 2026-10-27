@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
@@ -11,18 +13,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "processed" / "industrialpulse.duckdb"
 MANIFEST_PATH = ROOT / "data" / "raw" / "ai4i_manifest.json"
 DBT_RUN_RESULTS = ROOT / "target" / "run_results.json"
+INITIALIZER = ROOT / "scripts" / "initialize_warehouse.py"
 
 BG = "#07111D"
 PANEL = "#101F30"
-PANEL_ALT = "#14283A"
 TEAL = "#39E6C4"
 CYAN = "#49B9FF"
 AMBER = "#FFBD69"
@@ -38,9 +40,9 @@ st.set_page_config(
 )
 
 
-# ---------------------------------------------------------
-# VISUAL SYSTEM
-# ---------------------------------------------------------
+# =========================================================
+# DESIGN SYSTEM
+# =========================================================
 
 st.markdown(
     f"""
@@ -94,9 +96,7 @@ st.markdown(
         color: #FFFFFF;
     }}
 
-    .brand span {{
-        color: var(--teal);
-    }}
+    .brand span {{ color: var(--teal); }}
 
     .eyebrow {{
         font-family: 'DM Mono', monospace;
@@ -207,13 +207,6 @@ st.markdown(
         padding: 6px 10px;
     }}
 
-    .info-panel {{
-        background: #102132;
-        border: 1px solid #243E52;
-        border-radius: 15px;
-        padding: 18px 20px;
-    }}
-
     .mono {{
         font-family: 'DM Mono', monospace;
         color: #A7C1D5;
@@ -227,13 +220,8 @@ st.markdown(
         padding: 15px;
     }}
 
-    div[data-testid="stMetricLabel"] {{
-        color: #A8BDCF;
-    }}
-
-    div[data-testid="stMetricValue"] {{
-        color: #F4FAFF;
-    }}
+    div[data-testid="stMetricLabel"] {{ color: #A8BDCF; }}
+    div[data-testid="stMetricValue"] {{ color: #F4FAFF; }}
 
     .stTabs [data-baseweb="tab-list"] {{
         gap: 8px;
@@ -250,12 +238,6 @@ st.markdown(
     .stTabs [aria-selected="true"] {{
         background: #163A3B !important;
         border-color: #39E6C4 !important;
-    }}
-
-    div[data-testid="stDataFrame"] {{
-        border: 1px solid #243D50;
-        border-radius: 12px;
-        overflow: hidden;
     }}
 
     .footer {{
@@ -276,42 +258,99 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------
-# DATA ACCESS
-# ---------------------------------------------------------
+# =========================================================
+# WAREHOUSE INITIALISATION
+# =========================================================
 
-@st.cache_data(show_spinner="Loading industrial observations...")
-def load_observations(db_path: str, modified_time: float) -> pd.DataFrame:
-    """Load the dbt intermediate model from DuckDB."""
+def initialise_warehouse() -> None:
+    """
+    Build the local warehouse and dbt models when missing.
 
-    del modified_time  # Included in cache key to refresh after rebuilds.
+    The initializer uses the current Python interpreter, so this
+    works with Streamlit Cloud as well as a local virtual environment.
+    """
 
-    if not Path(db_path).exists():
+    if not INITIALIZER.exists():
         raise FileNotFoundError(
-            f"DuckDB database not found at {db_path}. "
-            "Run the ingestion and dbt pipeline first."
+            f"Warehouse initializer not found: {INITIALIZER}. "
+            "Ensure scripts/initialize_warehouse.py is committed."
         )
 
-    connection = duckdb.connect(db_path, read_only=True)
+    result = subprocess.run(
+        [sys.executable, str(INITIALIZER)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
 
-    try:
+    if result.returncode != 0:
+        details = result.stderr or result.stdout or "Unknown error"
+        raise RuntimeError(details)
+
+    if not DB_PATH.exists():
+        raise FileNotFoundError(
+            "The initializer completed, but the DuckDB file was not created."
+        )
+
+
+def ensure_warehouse() -> None:
+    """Ensure required warehouse relations exist."""
+
+    if DB_PATH.exists():
+        try:
+            with duckdb.connect(str(DB_PATH), read_only=True) as connection:
+                connection.execute(
+                    "SELECT 1 FROM main.int_machine_observations LIMIT 1"
+                )
+                connection.execute(
+                    "SELECT 1 FROM main.mart_maintenance_kpis LIMIT 1"
+                )
+            return
+        except Exception:
+            # Existing but incomplete or stale warehouse: rebuild models.
+            pass
+
+    with st.spinner(
+        "Initialising IndustrialPulse warehouse. "
+        "The first deployment may take a few minutes..."
+    ):
+        initialise_warehouse()
+
+
+# =========================================================
+# DATA ACCESS
+# =========================================================
+
+@st.cache_data(show_spinner=False)
+def load_observations(
+    db_path: str,
+    modified_time: float,
+) -> pd.DataFrame:
+    """Load transformed machine observations from DuckDB."""
+
+    del modified_time
+
+    with duckdb.connect(db_path, read_only=True) as connection:
         return connection.execute(
             """
             SELECT *
             FROM main.int_machine_observations
             """
         ).df()
-    finally:
-        connection.close()
 
 
-@st.cache_data
-def load_mart(db_path: str, modified_time: float) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_mart(
+    db_path: str,
+    modified_time: float,
+) -> pd.DataFrame:
+    """Load machine-type KPI aggregates."""
+
     del modified_time
 
-    connection = duckdb.connect(db_path, read_only=True)
-
-    try:
+    with duckdb.connect(db_path, read_only=True) as connection:
         return connection.execute(
             """
             SELECT *
@@ -319,8 +358,6 @@ def load_mart(db_path: str, modified_time: float) -> pd.DataFrame:
             ORDER BY machine_type
             """
         ).df()
-    finally:
-        connection.close()
 
 
 def load_json(path: Path) -> dict:
@@ -334,29 +371,15 @@ def load_json(path: Path) -> dict:
 
 
 def load_dbt_test_status() -> dict:
-    """Read the most recent available dbt run-results artifact."""
+    """Read the most recent available dbt test artifact."""
 
     result = load_json(DBT_RUN_RESULTS)
-    results = result.get("results", [])
-
-    if not results:
-        return {
-            "available": False,
-            "passed": 0,
-            "failed": 0,
-            "total": 0,
-        }
-
     tests = [
-        item for item in results
+        item for item in result.get("results", [])
         if item.get("unique_id", "").startswith("test.")
     ]
 
-    passed = sum(
-        item.get("status") == "pass"
-        for item in tests
-    )
-
+    passed = sum(item.get("status") == "pass" for item in tests)
     failed = sum(
         item.get("status") in {"fail", "error"}
         for item in tests
@@ -370,9 +393,9 @@ def load_dbt_test_status() -> dict:
     }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CHART HELPERS
-# ---------------------------------------------------------
+# =========================================================
 
 def style_chart(fig, height=350):
     fig.update_layout(
@@ -380,26 +403,11 @@ def style_chart(fig, height=350):
         height=height,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(
-            family="Manrope, sans-serif",
-            color=TEXT,
-            size=11,
-        ),
+        font=dict(family="Manrope, sans-serif", color=TEXT, size=11),
         margin=dict(l=12, r=12, t=35, b=12),
-        legend=dict(
-            bgcolor="rgba(0,0,0,0)",
-            borderwidth=0,
-        ),
-        xaxis=dict(
-            gridcolor="#23394A",
-            zerolinecolor="#23394A",
-            linecolor="#23394A",
-        ),
-        yaxis=dict(
-            gridcolor="#23394A",
-            zerolinecolor="#23394A",
-            linecolor="#23394A",
-        ),
+        legend=dict(bgcolor="rgba(0,0,0,0)", borderwidth=0),
+        xaxis=dict(gridcolor="#23394A", zerolinecolor="#23394A"),
+        yaxis=dict(gridcolor="#23394A", zerolinecolor="#23394A"),
         hoverlabel=dict(
             bgcolor="#13283A",
             bordercolor=TEAL,
@@ -432,26 +440,44 @@ def metric_card(label, value, note, accent=TEAL):
     )
 
 
-# ---------------------------------------------------------
-# LOAD DATA
-# ---------------------------------------------------------
-
-if not DB_PATH.exists():
-    st.error("Local warehouse not found.")
-    st.code(
-        ".\\.venv\\Scripts\\python.exe -m ingestion.load_local_warehouse\n"
-        ".\\.venv\\Scripts\\dbt.exe run"
+def render_hero(eyebrow: str, title: str, description: str):
+    st.markdown(
+        f"""
+        <div class="hero">
+            <div class="hero-orb"></div>
+            <div class="eyebrow">{eyebrow}</div>
+            <h1>{title}</h1>
+            <p>{description}</p>
+            <span class="status-pill">● SYNTHETIC RESEARCH DATASET</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    st.stop()
 
-db_modified = DB_PATH.stat().st_mtime
+
+# =========================================================
+# STARTUP AND ERROR HANDLING
+# =========================================================
 
 try:
+    ensure_warehouse()
+except Exception as exc:
+    st.error("IndustrialPulse could not initialise its warehouse.")
+    st.markdown(
+        "Check that the ingestion scripts, dbt models, dependencies, "
+        "and UCI dataset download are available in the deployment."
+    )
+    with st.expander("Technical details"):
+        st.code(str(exc))
+    st.stop()
+
+try:
+    db_modified = DB_PATH.stat().st_mtime
     data = load_observations(str(DB_PATH), db_modified)
     mart = load_mart(str(DB_PATH), db_modified)
 except Exception as exc:
-    st.error(f"Unable to load the dbt models: {exc}")
-    st.info("Build the project with `dbt run` and refresh the page.")
+    st.error("Unable to query the IndustrialPulse warehouse.")
+    st.code(str(exc))
     st.stop()
 
 if data.empty:
@@ -462,9 +488,9 @@ manifest = load_json(MANIFEST_PATH)
 dbt_status = load_dbt_test_status()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SIDEBAR
-# ---------------------------------------------------------
+# =========================================================
 
 with st.sidebar:
     st.markdown(
@@ -486,14 +512,17 @@ with st.sidebar:
             "Data Quality",
             "Data Explorer",
         ],
-        label_visibility="visible",
     )
 
     st.markdown("---")
-    st.markdown('<div class="eyebrow">OBSERVATION FILTERS</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="eyebrow">OBSERVATION FILTERS</div>',
+        unsafe_allow_html=True,
+    )
 
-    available_types = sorted(data["machine_type"].dropna().unique().tolist())
+    available_types = sorted(
+        data["machine_type"].dropna().unique().tolist()
+    )
 
     selected_types = st.multiselect(
         "Machine type",
@@ -503,7 +532,11 @@ with st.sidebar:
 
     failure_filter = st.selectbox(
         "Failure status",
-        ["All observations", "Failure only", "No recorded failure"],
+        [
+            "All observations",
+            "Failure only",
+            "No recorded failure",
+        ],
     )
 
     wear_min = int(data["tool_wear_min"].min())
@@ -536,19 +569,24 @@ with st.sidebar:
         st.rerun()
 
 
-# ---------------------------------------------------------
-# APPLY FILTERS
-# ---------------------------------------------------------
+# =========================================================
+# FILTERS AND KPI CALCULATIONS
+# =========================================================
 
 filtered = data.copy()
 
 if selected_types:
-    filtered = filtered[filtered["machine_type"].isin(selected_types)]
+    filtered = filtered[
+        filtered["machine_type"].isin(selected_types)
+    ]
 else:
     filtered = filtered.iloc[0:0]
 
 filtered = filtered[
-    filtered["tool_wear_min"].between(wear_range[0], wear_range[1])
+    filtered["tool_wear_min"].between(
+        wear_range[0],
+        wear_range[1],
+    )
 ]
 
 if failure_filter == "Failure only":
@@ -557,24 +595,30 @@ elif failure_filter == "No recorded failure":
     filtered = filtered[filtered["machine_failure"] == 0]
 
 total = len(filtered)
-failures = int(filtered["machine_failure"].sum()) if total else 0
+failures = (
+    int(filtered["machine_failure"].sum())
+    if total else 0
+)
 failure_rate = failures / total * 100 if total else 0.0
 avg_delta = (
     float(filtered["temperature_delta_k"].mean())
     if total else 0.0
 )
-avg_torque = float(filtered["torque_nm"].mean()) if total else 0.0
+avg_torque = (
+    float(filtered["torque_nm"].mean())
+    if total else 0.0
+)
 
 
-# ---------------------------------------------------------
-# GLOBAL HEADER
-# ---------------------------------------------------------
+# =========================================================
+# APP HEADER
+# =========================================================
 
 left, right = st.columns([4, 1])
 
 with left:
     st.markdown(
-        '<div class="eyebrow">INDUSTRIAL ANALYTICS PLATFORM / LIVE LOCAL MODEL</div>',
+        '<div class="eyebrow">INDUSTRIAL ANALYTICS PLATFORM / LOCAL WAREHOUSE</div>',
         unsafe_allow_html=True,
     )
 
@@ -587,37 +631,30 @@ with right:
 st.write("")
 
 
-# ---------------------------------------------------------
-# PAGE 1: COMMAND CENTRE
-# ---------------------------------------------------------
+# =========================================================
+# PAGE 1 — COMMAND CENTRE
+# =========================================================
 
 if page == "Command Centre":
 
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="hero-orb"></div>
-            <div class="eyebrow">RELIABILITY · PERFORMANCE · INTELLIGENCE</div>
-            <h1>See the signals.<br>Understand the system.</h1>
-            <p>
-                An interactive maintenance intelligence workspace that transforms
-                industrial sensor observations into measurable reliability KPIs,
-                supported by a tested dbt transformation pipeline.
-            </p>
-            <span class="status-pill">● SYNTHETIC RESEARCH DATASET</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_hero(
+        "RELIABILITY · PERFORMANCE · INTELLIGENCE",
+        "See the signals.<br>Understand the system.",
+        "An interactive maintenance intelligence workspace that transforms "
+        "industrial sensor observations into measurable reliability KPIs, "
+        "supported by a tested dbt transformation pipeline.",
     )
 
     if failure_filter != "All observations":
         st.info(
-            "KPIs and charts reflect your current failure-status filter. "
-            "Select 'All observations' for an overall overview."
+            "KPIs reflect your selected failure-status filter. "
+            "Select 'All observations' to see the full filtered population."
         )
 
-    st.markdown('<div class="eyebrow">SYSTEM SNAPSHOT</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="eyebrow">SYSTEM SNAPSHOT</div>',
+        unsafe_allow_html=True,
+    )
     st.write("")
 
     cols = st.columns(4)
@@ -671,7 +708,6 @@ if page == "Command Centre":
                     failures=("machine_failure", "sum"),
                 )
             )
-
             by_type["failure_rate_pct"] = (
                 by_type["failures"] / by_type["observations"] * 100
             )
@@ -681,25 +717,29 @@ if page == "Command Centre":
                 x="machine_type",
                 y="failure_rate_pct",
                 color="failure_rate_pct",
-                color_continuous_scale=["#238A8D", TEAL, AMBER, RED],
-                text=by_type["failure_rate_pct"].map(lambda x: f"{x:.2f}%"),
+                color_continuous_scale=[
+                    "#238A8D", TEAL, AMBER, RED
+                ],
+                text=by_type["failure_rate_pct"].map(
+                    lambda value: f"{value:.2f}%"
+                ),
                 hover_data=["observations", "failures"],
             )
-            fig.update_traces(
-                textposition="outside",
-                marker_line_width=0,
-            )
+            fig.update_traces(textposition="outside")
             fig.update_coloraxes(showscale=False)
             fig.update_yaxes(title="Failure rate (%)")
             fig.update_xaxes(title="Machine type")
-            st.plotly_chart(style_chart(fig), use_container_width=True)
+            st.plotly_chart(
+                style_chart(fig),
+                use_container_width=True,
+            )
         else:
             st.info("No observations match the current filters.")
 
     with chart_right:
         section_heading(
             "Failure-mode signals",
-            "Flag counts; multiple flags may occur in one observation.",
+            "Flag counts; multiple flags can occur in one observation.",
         )
 
         failure_columns = {
@@ -710,15 +750,15 @@ if page == "Command Centre":
             "random_failure": "Random",
         }
 
-        mode_values = pd.DataFrame(
-            [
-                {
-                    "Failure mode": label,
-                    "Flag count": int(filtered[column].sum()) if total else 0,
-                }
-                for column, label in failure_columns.items()
-            ]
-        ).sort_values("Flag count")
+        mode_values = pd.DataFrame([
+            {
+                "Failure mode": label,
+                "Flag count": (
+                    int(filtered[column].sum()) if total else 0
+                ),
+            }
+            for column, label in failure_columns.items()
+        ]).sort_values("Flag count")
 
         fig = px.bar(
             mode_values,
@@ -731,12 +771,15 @@ if page == "Command Centre":
         )
         fig.update_traces(textposition="outside")
         fig.update_coloraxes(showscale=False)
-        st.plotly_chart(style_chart(fig), use_container_width=True)
+        st.plotly_chart(
+            style_chart(fig),
+            use_container_width=True,
+        )
 
     st.write("")
     section_heading(
         "Sensor operating envelope",
-        "Explore torque against rotational speed; colour shows the recorded failure label.",
+        "Torque against rotational speed, coloured by recorded failure outcome.",
     )
 
     if total:
@@ -746,7 +789,6 @@ if page == "Command Centre":
             y="torque_nm",
             color="is_machine_failure",
             color_discrete_map={True: RED, False: TEAL},
-            category_orders={"is_machine_failure": [False, True]},
             labels={
                 "rotational_speed_rpm": "Rotational speed (RPM)",
                 "torque_nm": "Torque (Nm)",
@@ -760,34 +802,28 @@ if page == "Command Centre":
             ],
             opacity=0.72,
         )
-        st.plotly_chart(style_chart(fig, 420), use_container_width=True)
+        st.plotly_chart(
+            style_chart(fig, 420),
+            use_container_width=True,
+        )
 
     st.caption(
         "The dataset contains synthetic observations, not live plant telemetry. "
-        "No time-series history is available, so the dashboard does not claim "
-        "real-time monitoring or forecast future failures."
+        "This application does not claim to monitor a live industrial asset."
     )
 
 
-# ---------------------------------------------------------
-# PAGE 2: FAILURE INTELLIGENCE
-# ---------------------------------------------------------
+# =========================================================
+# PAGE 2 — FAILURE INTELLIGENCE
+# =========================================================
 
 elif page == "Failure Intelligence":
 
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">RELIABILITY ENGINEERING</div>
-            <h1>Failure Intelligence</h1>
-            <p>
-                Compare failure observations, inspect failure-mode signals,
-                and investigate how operating conditions differ in the
-                available synthetic dataset.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_hero(
+        "RELIABILITY ENGINEERING",
+        "Failure Intelligence",
+        "Compare failure observations, inspect failure-mode signals, "
+        "and investigate how operating conditions differ in the dataset.",
     )
 
     c1, c2, c3 = st.columns(3)
@@ -799,8 +835,8 @@ elif page == "Failure Intelligence":
 
     with left:
         section_heading(
-            "Failure rate and sample size",
-            "Rates should be interpreted alongside the number of observations.",
+            "Failure rate by type",
+            "Interpret rates alongside their observation counts.",
         )
 
         if total:
@@ -812,14 +848,17 @@ elif page == "Failure Intelligence":
                 )
             )
             type_summary["rate"] = (
-                type_summary["failures"] / type_summary["observations"] * 100
+                type_summary["failures"]
+                / type_summary["observations"] * 100
             )
 
             fig = px.bar(
                 type_summary,
                 x="machine_type",
                 y="rate",
-                text=type_summary["rate"].map(lambda x: f"{x:.2f}%"),
+                text=type_summary["rate"].map(
+                    lambda value: f"{value:.2f}%"
+                ),
                 hover_data=["observations", "failures"],
                 color="rate",
                 color_continuous_scale=["#238A8D", TEAL, RED],
@@ -827,30 +866,31 @@ elif page == "Failure Intelligence":
             fig.update_coloraxes(showscale=False)
             fig.update_traces(textposition="outside")
             fig.update_yaxes(title="Failure rate (%)")
-            st.plotly_chart(style_chart(fig), use_container_width=True)
+            st.plotly_chart(
+                style_chart(fig),
+                use_container_width=True,
+            )
 
     with right:
         section_heading(
-            "Recorded failure-mode flags",
-            "Flags are not mutually exclusive.",
+            "Failure-mode flag distribution",
+            "Flags can overlap; they are not mutually exclusive.",
         )
 
         if total:
-            mode_df = pd.DataFrame(
-                [
-                    {
-                        "Mode": label,
-                        "Count": int(filtered[column].sum()),
-                    }
-                    for column, label in {
-                        "tool_wear_failure": "Tool wear",
-                        "heat_dissipation_failure": "Heat dissipation",
-                        "power_failure": "Power",
-                        "overstrain_failure": "Overstrain",
-                        "random_failure": "Random",
-                    }.items()
-                ]
-            )
+            mode_df = pd.DataFrame([
+                {
+                    "Mode": label,
+                    "Count": int(filtered[column].sum()),
+                }
+                for column, label in {
+                    "tool_wear_failure": "Tool wear",
+                    "heat_dissipation_failure": "Heat dissipation",
+                    "power_failure": "Power",
+                    "overstrain_failure": "Overstrain",
+                    "random_failure": "Random",
+                }.items()
+            ])
 
             fig = px.pie(
                 mode_df,
@@ -865,33 +905,37 @@ elif page == "Failure Intelligence":
                 textposition="inside",
                 textinfo="label+percent",
             )
-            st.plotly_chart(style_chart(fig), use_container_width=True)
+            st.plotly_chart(
+                style_chart(fig),
+                use_container_width=True,
+            )
 
     section_heading(
         "Failure versus non-failure observations",
-        "Sensor distributions help identify patterns for further investigation.",
+        "Compare sensor distributions by recorded outcome.",
     )
 
     if total:
         compare = filtered.copy()
-        compare["Outcome"] = compare["machine_failure"].map(
-            {0: "No recorded failure", 1: "Recorded failure"}
-        )
+        compare["Outcome"] = compare["machine_failure"].map({
+            0: "No recorded failure",
+            1: "Recorded failure",
+        })
 
         sensor_choice = st.selectbox(
-            "Sensor metric to compare",
+            "Sensor metric",
             [
                 "torque_nm",
                 "rotational_speed_rpm",
                 "tool_wear_min",
                 "temperature_delta_k",
             ],
-            format_func=lambda x: {
+            format_func=lambda value: {
                 "torque_nm": "Torque (Nm)",
                 "rotational_speed_rpm": "Rotational speed (RPM)",
                 "tool_wear_min": "Tool wear (minutes)",
                 "temperature_delta_k": "Temperature delta (K)",
-            }[x],
+            }[value],
         )
 
         fig = px.box(
@@ -905,33 +949,28 @@ elif page == "Failure Intelligence":
             },
             points="outliers",
         )
-        st.plotly_chart(style_chart(fig, 400), use_container_width=True)
+        st.plotly_chart(
+            style_chart(fig, 400),
+            use_container_width=True,
+        )
 
     st.warning(
-        "Association is not causation. This exploratory view does not establish "
-        "root causes or validate a predictive-maintenance model."
+        "Associations do not prove causation. This is exploratory analysis, "
+        "not a validated root-cause or predictive model."
     )
 
 
-# ---------------------------------------------------------
-# PAGE 3: SENSOR LABORATORY
-# ---------------------------------------------------------
+# =========================================================
+# PAGE 3 — SENSOR LABORATORY
+# =========================================================
 
 elif page == "Sensor Laboratory":
 
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">SENSOR ANALYTICS WORKBENCH</div>
-            <h1>Explore the signals.</h1>
-            <p>
-                Select sensor variables, inspect relationships, and compare
-                recorded failure outcomes. Use this space to formulate
-                hypotheses for later statistical analysis and modelling.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_hero(
+        "SENSOR ANALYTICS WORKBENCH",
+        "Explore the signals.",
+        "Select sensor variables, inspect relationships, and compare "
+        "recorded failure outcomes.",
     )
 
     sensor_labels = {
@@ -953,7 +992,7 @@ elif page == "Sensor Laboratory":
             "X-axis sensor",
             choices,
             index=3,
-            format_func=lambda x: sensor_labels[x],
+            format_func=lambda value: sensor_labels[value],
         )
 
     with y_col:
@@ -961,18 +1000,22 @@ elif page == "Sensor Laboratory":
             "Y-axis sensor",
             choices,
             index=4,
-            format_func=lambda x: sensor_labels[x],
+            format_func=lambda value: sensor_labels[value],
         )
 
     with colour_col:
         colour_by = st.selectbox(
             "Colour observations by",
-            ["machine_failure", "machine_type", "primary_failure_category"],
-            format_func=lambda x: {
+            [
+                "machine_failure",
+                "machine_type",
+                "primary_failure_category",
+            ],
+            format_func=lambda value: {
                 "machine_failure": "Recorded failure outcome",
                 "machine_type": "Machine type",
                 "primary_failure_category": "Primary reporting category",
-            }[x],
+            }[value],
         )
 
     if total:
@@ -996,9 +1039,11 @@ elif page == "Sensor Laboratory":
             },
             opacity=0.72,
         )
-        st.plotly_chart(style_chart(fig, 520), use_container_width=True)
+        st.plotly_chart(
+            style_chart(fig, 520),
+            use_container_width=True,
+        )
 
-        st.write("")
         left, right = st.columns(2)
 
         with left:
@@ -1029,18 +1074,18 @@ elif page == "Sensor Laboratory":
                 zmax=1,
                 aspect="auto",
             )
-            st.plotly_chart(style_chart(fig, 480), use_container_width=True)
+            st.plotly_chart(
+                style_chart(fig, 480),
+                use_container_width=True,
+            )
 
         with right:
             section_heading(
                 "Descriptive statistics",
-                "Summary of selected observations after sidebar filters.",
+                "Statistics for observations matching the current filters.",
             )
 
-            stats = filtered[
-                list(sensor_labels)
-            ].describe().T.reset_index()
-
+            stats = filtered[list(sensor_labels)].describe().T.reset_index()
             stats = stats.rename(columns={"index": "Sensor"})
             stats["Sensor"] = stats["Sensor"].map(sensor_labels)
 
@@ -1051,30 +1096,22 @@ elif page == "Sensor Laboratory":
             )
 
     st.caption(
-        "Correlations are exploratory and may be affected by class imbalance, "
-        "synthetic data generation, and the dataset's sampling design."
+        "Correlations are exploratory and may be affected by class imbalance "
+        "and the synthetic data generation process."
     )
 
 
-# ---------------------------------------------------------
-# PAGE 4: DATA QUALITY
-# ---------------------------------------------------------
+# =========================================================
+# PAGE 4 — DATA QUALITY
+# =========================================================
 
 elif page == "Data Quality":
 
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">TRUST · LINEAGE · REPRODUCIBILITY</div>
-            <h1>Data Quality Centre</h1>
-            <p>
-                Inspect source validation metadata, dbt test artifacts,
-                transformation lineage, and the controls that make this
-                analytics workflow reproducible.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_hero(
+        "TRUST · LINEAGE · REPRODUCIBILITY",
+        "Data Quality Centre",
+        "Inspect source validation metadata, dbt test artifacts, "
+        "transformation lineage, and reproducibility controls.",
     )
 
     raw_rows = manifest.get("row_count", "Not recorded")
@@ -1084,19 +1121,20 @@ elif page == "Data Quality":
 
     a, b, c, d = st.columns(4)
 
-    a.metric("Source rows", f"{raw_rows:,}" if isinstance(raw_rows, int) else raw_rows)
+    a.metric(
+        "Source rows",
+        f"{raw_rows:,}" if isinstance(raw_rows, int) else raw_rows,
+    )
     b.metric("Source columns", raw_columns)
     c.metric("Missing source values", missing)
     d.metric("Source validation", str(validation).upper())
-
-    st.write("")
 
     left, right = st.columns(2)
 
     with left:
         section_heading(
             "dbt test artifact",
-            "Status is read from target/run_results.json when available.",
+            "Latest available results from target/run_results.json.",
         )
 
         if dbt_status["available"]:
@@ -1106,19 +1144,22 @@ elif page == "Data Quality":
             t3.metric("Tests in artifact", dbt_status["total"])
 
             if dbt_status["failed"] == 0:
-                st.success("No failed tests were recorded in this artifact.")
+                st.success(
+                    "No failed tests were recorded in this artifact."
+                )
             else:
-                st.error("The latest available artifact includes failed tests.")
+                st.error(
+                    "The available artifact contains failed tests."
+                )
         else:
             st.info(
-                "No dbt test results were found in target/run_results.json. "
-                "Run `dbt test` to generate the artifact."
+                "No dbt test results found. Run `dbt test` to generate them."
             )
 
     with right:
         section_heading(
             "Source manifest",
-            "Metadata produced by the ingestion validation step.",
+            "Metadata created by the ingestion validation process.",
         )
 
         if manifest:
@@ -1140,7 +1181,7 @@ elif page == "Data Quality":
     st.write("")
     section_heading(
         "Transformation lineage",
-        "The flow from source data to business reporting.",
+        "From raw observations to business-facing KPIs.",
     )
 
     lineage_cols = st.columns(4)
@@ -1152,7 +1193,9 @@ elif page == "Data Quality":
         ("04", "MART", "mart_maintenance_kpis", "Business aggregates"),
     ]
 
-    for column, (number, layer, name, description) in zip(lineage_cols, lineage):
+    for column, (number, layer, name, description) in zip(
+        lineage_cols, lineage
+    ):
         with column:
             st.markdown(
                 f"""
@@ -1169,49 +1212,44 @@ elif page == "Data Quality":
                 unsafe_allow_html=True,
             )
 
-    st.write("")
     section_heading(
         "Data contracts and controls",
-        "Implemented checks and their purpose.",
+        "Checks implemented in the ingestion and dbt layers.",
     )
 
     controls = pd.DataFrame([
-        ["Schema validation", "Expected source columns", "Ingestion validation"],
-        ["Completeness", "No missing source values", "Ingestion validation"],
-        ["Source integrity", "SHA-256 checksum manifest", "Ingestion validation"],
-        ["Primary-key quality", "Non-null and unique source record IDs", "dbt tests"],
+        ["Schema validation", "Expected source columns", "Ingestion"],
+        ["Completeness", "No missing source values", "Ingestion"],
+        ["Source integrity", "SHA-256 checksum manifest", "Ingestion"],
+        ["Primary-key quality", "Non-null and unique record IDs", "dbt tests"],
         ["Domain validation", "Machine types L, M, H", "dbt tests"],
         ["Flag validation", "Binary failure flags", "dbt tests"],
-        ["KPI logic", "Valid failure counts and percentages", "Singular dbt test"],
+        ["KPI logic", "Valid counts and percentages", "Singular dbt test"],
     ], columns=["Control", "Rule", "Layer"])
 
-    st.dataframe(controls, use_container_width=True, hide_index=True)
+    st.dataframe(
+        controls,
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.caption(
-        "The dbt results shown here depend on the latest available run-results "
-        "artifact. The UI does not independently rerun tests when the page opens."
+        "Test status is based on the most recent available run-results artifact. "
+        "Opening this page does not independently execute dbt tests."
     )
 
 
-# ---------------------------------------------------------
-# PAGE 5: DATA EXPLORER
-# ---------------------------------------------------------
+# =========================================================
+# PAGE 5 — DATA EXPLORER
+# =========================================================
 
 elif page == "Data Explorer":
 
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">TRANSPARENCY · INVESTIGATION · EXPORT</div>
-            <h1>Observation Explorer</h1>
-            <p>
-                Browse the transformed observations behind the charts.
-                Apply the global filters, inspect records, and export the
-                selected dataset for further analysis.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_hero(
+        "TRANSPARENCY · INVESTIGATION · EXPORT",
+        "Observation Explorer",
+        "Browse transformed observations, search record IDs, "
+        "and export the current selection for further analysis.",
     )
 
     st.metric("Rows in current selection", f"{total:,}")
@@ -1227,7 +1265,8 @@ elif page == "Data Explorer":
         if search_id.strip():
             if search_id.strip().isdigit():
                 displayed = displayed[
-                    displayed["source_record_id"] == int(search_id.strip())
+                    displayed["source_record_id"]
+                    == int(search_id.strip())
                 ]
             else:
                 displayed = displayed.iloc[0:0]
@@ -1239,22 +1278,19 @@ elif page == "Data Explorer":
             height=480,
         )
 
-        csv_bytes = displayed.to_csv(index=False).encode("utf-8")
-
         st.download_button(
             "Download filtered observations (CSV)",
-            data=csv_bytes,
+            data=displayed.to_csv(index=False).encode("utf-8"),
             file_name="industrialpulse_filtered_observations.csv",
             mime="text/csv",
-            use_container_width=False,
         )
     else:
         st.info("No observations match the current filters.")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # FOOTER
-# ---------------------------------------------------------
+# =========================================================
 
 st.markdown(
     """
