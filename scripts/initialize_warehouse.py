@@ -1,131 +1,192 @@
-
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = sys.executable
-
 RAW_CSV = ROOT / "data" / "raw" / "ai4i_2020_predictive_maintenance.csv"
-STANDARDIZED_CSV = ROOT / "data" / "processed" / "ai4i_machine_data.csv"
 DATABASE = ROOT / "data" / "processed" / "industrialpulse.duckdb"
-
-# A project-local profile directory works in Linux and Windows.
 PROFILES_DIR = ROOT / ".dbt_profiles"
+LOG_DIR = ROOT / "logs"
+LOG_FILE = LOG_DIR / "warehouse_initialization.log"
 
 
-def run_step(description: str, command: list[str]) -> None:
-    """Run a pipeline step and show its output on failure."""
+def write_log(message: str) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as file:
+        file.write(message.rstrip() + "\n")
 
-    print(f"\n{'=' * 60}\n{description}\n{'=' * 60}")
 
-    result = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=os.environ.copy(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_step(label: str, command: list[str], timeout: int = 900) -> str:
+    print(f"\n{'=' * 72}\n{label}\n{'=' * 72}", flush=True)
+    write_log(f"\n{'=' * 72}\n{label}\nCOMMAND: {' '.join(command)}")
 
-    if result.stdout:
-        print(result.stdout)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        write_log(output)
+        raise RuntimeError(
+            f"{label} timed out after {timeout} seconds.\n{output}"
+        ) from exc
+
+    output = result.stdout or ""
+    print(output, flush=True)
+    write_log(output)
 
     if result.returncode != 0:
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-
         raise RuntimeError(
-            f"{description} failed with exit code {result.returncode}"
+            f"{label} failed with exit code {result.returncode}.\n"
+            f"Full output saved in {LOG_FILE}.\n\n{output[-14000:]}"
         )
 
-    if result.stderr:
-        # Preserve warnings without treating them as failures.
-        print(result.stderr, file=sys.stderr)
+    return output
 
 
-def create_dbt_profile() -> None:
-    """Create a DuckDB profile for this deployment environment."""
-
+def create_profile() -> None:
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use forward slashes so the path works with dbt on Windows too.
     database_path = DATABASE.resolve().as_posix()
-
-    profile = f"""industrialpulse:
-  target: dev
-  outputs:
-    dev:
-      type: duckdb
-      path: '{database_path}'
-      schema: main
-      threads: 4
-"""
-
-    (PROFILES_DIR / "profiles.yml").write_text(
-        profile,
-        encoding="utf-8",
+    profile_text = (
+        "industrialpulse:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      type: duckdb\n"
+        f"      path: '{database_path}'\n"
+        "      schema: main\n"
+        "      threads: 4\n"
     )
 
-    print(f"Created dbt profile: {PROFILES_DIR / 'profiles.yml'}")
-    print(f"DuckDB database: {DATABASE}")
+    profile_file = PROFILES_DIR / "profiles.yml"
+    profile_file.write_text(profile_text, encoding="utf-8")
+    print(f"Created dbt profile: {profile_file}", flush=True)
 
 
-def run_dbt(*arguments: str) -> None:
-    """Run dbt with the explicitly configured project and profile."""
+def dbt_command(*args: str) -> list[str]:
+    dbt_executable = shutil.which("dbt")
 
-    run_step(
-        f"dbt {' '.join(arguments)}",
-        [
-            PYTHON,
-            "-m",
-            "dbt.cli.main",
-            *arguments,
-            "--project-dir",
-            str(ROOT),
-            "--profiles-dir",
-            str(PROFILES_DIR),
-        ],
-    )
+    if dbt_executable:
+        return [
+            dbt_executable, *args,
+            "--project-dir", str(ROOT),
+            "--profiles-dir", str(PROFILES_DIR),
+            "--no-use-colors",
+        ]
+
+    return [
+        sys.executable, "-m", "dbt.cli.main", *args,
+        "--project-dir", str(ROOT),
+        "--profiles-dir", str(PROFILES_DIR),
+        "--no-use-colors",
+    ]
+
+
+def run_dbt(*args: str) -> None:
+    run_step(f"dbt {' '.join(args)}", dbt_command(*args))
 
 
 def main() -> None:
-    """Download, validate, standardise, load, and transform the dataset."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.write_text(
+        "IndustrialPulse warehouse initialization log\n",
+        encoding="utf-8",
+    )
 
-    create_dbt_profile()
+    required_files = [
+        ROOT / "dbt_project.yml",
+        ROOT / "ingestion" / "download_ai4i.py",
+        ROOT / "ingestion" / "validate_ai4i.py",
+        ROOT / "ingestion" / "standardize_ai4i.py",
+        ROOT / "ingestion" / "load_local_warehouse.py",
+        ROOT / "models" / "staging" / "sources.yml",
+    ]
+
+    missing_files = [str(path) for path in required_files if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError(
+            "Required project files are missing:\n" + "\n".join(missing_files)
+        )
+
+    create_profile()
 
     if not RAW_CSV.exists():
         run_step(
-            "Downloading AI4I dataset",
-            [PYTHON, "-m", "ingestion.download_ai4i"],
+            "Downloading UCI AI4I dataset",
+            [sys.executable, "-m", "ingestion.download_ai4i"],
+            timeout=600,
         )
 
     run_step(
         "Validating source dataset",
-        [PYTHON, "-m", "ingestion.validate_ai4i"],
+        [sys.executable, "-m", "ingestion.validate_ai4i"],
+    )
+    run_step(
+        "Standardising source dataset",
+        [sys.executable, "-m", "ingestion.standardize_ai4i"],
+    )
+    run_step(
+        "Loading DuckDB raw table",
+        [sys.executable, "-m", "ingestion.load_local_warehouse"],
     )
 
-    run_step(
-        "Standardising source data",
-        [PYTHON, "-m", "ingestion.standardize_ai4i"],
-    )
-
-    # Always reload so the warehouse matches the current processed CSV.
-    run_step(
-        "Loading local DuckDB warehouse",
-        [PYTHON, "-m", "ingestion.load_local_warehouse"],
-    )
+    if not DATABASE.exists():
+        raise FileNotFoundError(f"DuckDB database was not created: {DATABASE}")
 
     run_dbt("debug")
-    run_dbt("run")
-    run_dbt("test")
+    run_dbt("run", "--no-partial-parse")
+    run_dbt("test", "--no-partial-parse")
 
-    print("\nIndustrialPulse warehouse initialisation completed successfully.")
+    import duckdb
+
+    with duckdb.connect(str(DATABASE), read_only=True) as connection:
+        observation_count = connection.execute(
+            "SELECT COUNT(*) FROM main.int_machine_observations"
+        ).fetchone()[0]
+        mart_count = connection.execute(
+            "SELECT COUNT(*) FROM main.mart_maintenance_kpis"
+        ).fetchone()[0]
+
+    if observation_count <= 0 or mart_count <= 0:
+        raise RuntimeError(
+            f"Warehouse verification failed: observations={observation_count}, "
+            f"KPI rows={mart_count}"
+        )
+
+    success_message = (
+        "\nWAREHOUSE INITIALISATION SUCCEEDED\n"
+        f"Observations: {observation_count:,}\n"
+        f"KPI rows: {mart_count:,}\n"
+    )
+    print(success_message, flush=True)
+    write_log(success_message)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        error_message = (
+            "\nWAREHOUSE INITIALISATION FAILED\n"
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        print(error_message, file=sys.stderr, flush=True)
+        write_log(error_message)
+        raise
