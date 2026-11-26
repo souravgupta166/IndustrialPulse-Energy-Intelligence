@@ -1,33 +1,43 @@
-# Python and virtual environments
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+
+# Virtual environments
 .venv/
 venv/
-.pytest_cache/
-.coverage
+env/
 
-# Secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
-# Local data and database files
+# Data and databases
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 *.duckdb
+*.db
 *.sqlite
 
-# Generated dbt files
+# dbt generated files
 target/
 dbt_packages/
 logs/
-
-# Streamlit secrets
-.streamlit/secrets.toml
-# Local DuckDB databases
-*.duckdb
-*.sqlite
-# Generated deployment-specific dbt profile
 .dbt_profiles/
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating system
+.DS_Store
+Thumbs.db
