@@ -259,62 +259,66 @@ st.markdown(
 
 
 # =========================================================
+# =========================================================
 # WAREHOUSE INITIALISATION
 # =========================================================
 
 def initialise_warehouse() -> None:
-    """
-    Build the local warehouse and dbt models when missing.
-
-    The initializer uses the current Python interpreter, so this
-    works with Streamlit Cloud as well as a local virtual environment.
-    """
-
+    """Run ingestion and dbt, preserving combined diagnostics."""
     if not INITIALIZER.exists():
         raise FileNotFoundError(
-            f"Warehouse initializer not found: {INITIALIZER}. "
-            "Ensure scripts/initialize_warehouse.py is committed."
+            f"Missing initializer: {INITIALIZER}. "
+            "Commit scripts/initialize_warehouse.py to the repository."
         )
 
     result = subprocess.run(
         [sys.executable, str(INITIALIZER)],
         cwd=ROOT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=600,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1200,
         check=False,
     )
 
+    output = result.stdout or ""
+    if output:
+        print(output)
+
     if result.returncode != 0:
-        details = result.stderr or result.stdout or "Unknown error"
-        raise RuntimeError(details)
+        raise RuntimeError(
+            "Warehouse initializer failed. Complete output follows:\\n\\n"
+            + output[-18000:]
+        )
 
     if not DB_PATH.exists():
         raise FileNotFoundError(
-            "The initializer completed, but the DuckDB file was not created."
+            f"Initializer returned success but database was not created: {DB_PATH}"
         )
 
 
 def ensure_warehouse() -> None:
-    """Ensure required warehouse relations exist."""
-
+    """Verify both required dashboard relations; rebuild if missing."""
     if DB_PATH.exists():
         try:
             with duckdb.connect(str(DB_PATH), read_only=True) as connection:
-                connection.execute(
-                    "SELECT 1 FROM main.int_machine_observations LIMIT 1"
-                )
-                connection.execute(
-                    "SELECT 1 FROM main.mart_maintenance_kpis LIMIT 1"
-                )
-            return
+                observation_count = connection.execute(
+                    "SELECT COUNT(*) FROM main.int_machine_observations"
+                ).fetchone()[0]
+                mart_count = connection.execute(
+                    "SELECT COUNT(*) FROM main.mart_maintenance_kpis"
+                ).fetchone()[0]
+
+            if observation_count > 0 and mart_count > 0:
+                return
         except Exception:
-            # Existing but incomplete or stale warehouse: rebuild models.
             pass
 
     with st.spinner(
-        "Initialising IndustrialPulse warehouse. "
-        "The first deployment may take a few minutes..."
+        "Building the IndustrialPulse warehouse. "
+        "The first deployment may take several minutes..."
     ):
         initialise_warehouse()
 
@@ -464,11 +468,22 @@ try:
 except Exception as exc:
     st.error("IndustrialPulse could not initialise its warehouse.")
     st.markdown(
-        "Check that the ingestion scripts, dbt models, dependencies, "
-        "and UCI dataset download are available in the deployment."
+        "The warehouse build failed. The details below include the actual "
+        "dbt or ingestion output, rather than only a wrapper error."
     )
-    with st.expander("Technical details"):
-        st.code(str(exc))
+    with st.expander("Full technical details", expanded=True):
+        st.code(str(exc), language="text")
+
+    log_file = ROOT / "logs" / "warehouse_initialization.log"
+    if log_file.exists():
+        with st.expander("Warehouse initialisation log"):
+            st.code(
+                log_file.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )[-18000:],
+                language="text",
+            )
     st.stop()
 
 try:
